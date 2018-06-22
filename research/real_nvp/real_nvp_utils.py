@@ -439,7 +439,7 @@ def squeeze_2x2_ordered(input_, reverse=False):
     if reverse:
         if channels % 4 != 0:
             raise ValueError("Number of channels not divisible by 4.")
-        channels /= 4
+        channels //= 4
     else:
         if height % 2 != 0:
             raise ValueError("Height not divisible by 2.")

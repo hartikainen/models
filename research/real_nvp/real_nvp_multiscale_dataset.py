@@ -32,6 +32,7 @@ import os
 import numpy
 from six.moves import xrange
 import tensorflow as tf
+import numpy as np
 
 from tensorflow import gfile
 
@@ -219,7 +220,7 @@ def resnet(input_, dim_in, dim, dim_out, name, use_batch_norm=True,
                                      bottleneck=bottleneck)
                 if skip:
                     out += conv_layer(
-                        input_=res, filter_size=[1, 1], dim_in=dim, dim_out=dim,
+                          input_=res, filter_size=[1, 1], dim_in=dim, dim_out=dim,
                         name="skip_%d" % idx_block, stddev=numpy.sqrt(2. / (dim)),
                         strides=[1, 1, 1, 1], padding="SAME",
                         nonlinearity=None, bias=True,
@@ -663,8 +664,12 @@ def rec_masked_conv_coupling(input_, hps, scale_idx, n_scale,
     skip = hps.skip
     log_diff = tf.zeros_like(input_)
     dim = base_dim
+
+
     if FLAGS.recursion_type < 4:
         dim *= 2 ** scale_idx
+
+
     with tf.variable_scope("scale_%d" % scale_idx):
         # initial coupling layers
         res, inc_log_diff = masked_conv_coupling(
@@ -697,6 +702,8 @@ def rec_masked_conv_coupling(input_, hps, scale_idx, n_scale,
             bottleneck=hps.bottleneck, use_aff=True,
             use_width=1., use_height=1., skip=skip)
         log_diff += inc_log_diff
+
+
     if scale_idx < (n_scale - 1):
         with tf.variable_scope("scale_%d" % scale_idx):
             res = squeeze_2x2(res)
@@ -730,6 +737,8 @@ def rec_masked_conv_coupling(input_, hps, scale_idx, n_scale,
             log_diff += inc_log_diff
             res = unsqueeze_2x2(res)
             log_diff = unsqueeze_2x2(log_diff)
+
+
         if FLAGS.recursion_type > 1:
             res = squeeze_2x2_ordered(res)
             log_diff = squeeze_2x2_ordered(log_diff)
@@ -822,6 +831,8 @@ def rec_masked_deconv_coupling(input_, hps, scale_idx, n_scale,
                 train=train)
             res = squeeze_2x2_ordered(res, reverse=True)
             log_diff = squeeze_2x2_ordered(log_diff, reverse=True)
+
+
         with tf.variable_scope("scale_%d" % scale_idx):
             res = squeeze_2x2(res)
             log_diff = squeeze_2x2(log_diff)
@@ -1039,19 +1050,99 @@ class RealNVP(object):
             x_in = tf.reshape(x_orig, [hps.batch_size, 64, 64, 3])
             x_in = (tf.cast(x_in, tf.float32)
                     + tf.random_uniform(tf.shape(x_in))) / 256.
+        if FLAGS.dataset == "moving-mnist":
+            with tf.device(
+                tf.train.replica_device_setter(0, worker_device=device)):
+                filename_queue = tf.train.string_input_producer(
+                    gfile.Glob(FLAGS.data_path), num_epochs=None)
+                reader = tf.TFRecordReader()
+                _, serialized_example = reader.read(filename_queue)
+                features = tf.parse_single_example(
+                    serialized_example,
+                    features={
+                        "image_pair": tf.FixedLenFeature([], tf.string),
+                    })
+                pair = tf.decode_raw(features["image_pair"], tf.uint8)
+                pair.set_shape([2 * FLAGS.image_size * FLAGS.image_size * 1])
+                pair = tf.cast(pair, tf.float32)
+                if FLAGS.mode == "train":
+                    pairs = tf.train.shuffle_batch(
+                        [pair], batch_size=hps.batch_size//2, num_threads=1,
+                        capacity=1000 + 3 * hps.batch_size,
+                        # Ensures a minimum amount of shuffling of examples.
+                        min_after_dequeue=1000)
+                else:
+                    pairs = tf.train.batch(
+                        [pair], batch_size=hps.batch_size//2, num_threads=1,
+                        capacity=1000 + 3 * hps.batch_size)
+            image_size = FLAGS.image_size
+            pairs = tf.clip_by_value(pairs, 0, 255)
+            pairs = (tf.cast(pairs, tf.float32)
+                     + tf.random_uniform(tf.shape(pairs))) / 256.
+            pairs = tf.reshape(
+              pairs, [hps.batch_size//2, 2] + [image_size, image_size, 1])
+
+            pairs_1, pairs_2 = tf.split(pairs, 2, axis=1)
+            pairs_1 = tf.squeeze(pairs_1, axis=1)
+            pairs_2 = tf.squeeze(pairs_2, axis=1)
+            self.x_orig = x_orig = tf.concat([pairs_1, pairs_2], axis=0)
+
+            x_in = x_orig
+
+            # x_in = tf.split(pairs, 2, axis=0)
+            # x_in = tf.reshape(
+            #     x_orig,
+            #     [hps.batch_size, FLAGS.image_size, FLAGS.image_size, 1])
         else:
             raise ValueError("Unknown dataset.")
-        x_in = tf.reshape(x_in, [hps.batch_size, image_size, image_size, 3])
+        final_shape = [image_size, image_size, 1]
+        x_in = tf.reshape(x_in, [hps.batch_size] + final_shape)
+
+        sanity_pairs_side_shown = int(numpy.sqrt(hps.batch_size/2))
+        sanity_pairs_1, sanity_pairs_2 = tf.split(x_in, 2, axis=0)
+
+        sanity_pairs_1 = tf.transpose(
+          tf.reshape(
+            sanity_pairs_1[:(sanity_pairs_side_shown * sanity_pairs_side_shown), :, :, :],
+            [sanity_pairs_side_shown, image_size * sanity_pairs_side_shown, image_size, 1]),
+          [0, 2, 1, 3])
+        sanity_pairs_1 = tf.transpose(
+          tf.reshape(
+            sanity_pairs_1,
+            [1, image_size * sanity_pairs_side_shown, image_size * sanity_pairs_side_shown, 1]),
+          [0, 2, 1, 3]) * 255.
+
+        sanity_pairs_2 = tf.transpose(
+          tf.reshape(
+            sanity_pairs_2[:(sanity_pairs_side_shown * sanity_pairs_side_shown), :, :, :],
+            [sanity_pairs_side_shown, image_size * sanity_pairs_side_shown, image_size, 1]),
+          [0, 2, 1, 3])
+        sanity_pairs_2 = tf.transpose(
+          tf.reshape(
+            sanity_pairs_2,
+            [1, image_size * sanity_pairs_side_shown, image_size * sanity_pairs_side_shown, 1]),
+          [0, 2, 1, 3]) * 255.
+
+        tf.summary.image(
+            "sanity_1 (same sequence as sanity_2)",
+            tf.cast(sanity_pairs_1, tf.uint8),
+            max_outputs=1)
+        tf.summary.image(
+            "sanity_2 (same sequence as sanity_1)",
+            tf.cast(sanity_pairs_2, tf.uint8),
+            max_outputs=1)
+
         side_shown = int(numpy.sqrt(hps.batch_size))
+
         shown_x = tf.transpose(
             tf.reshape(
                 x_in[:(side_shown * side_shown), :, :, :],
-                [side_shown, image_size * side_shown, image_size, 3]),
+                [side_shown, image_size * side_shown, image_size, 1]),
             [0, 2, 1, 3])
         shown_x = tf.transpose(
             tf.reshape(
                 shown_x,
-                [1, image_size * side_shown, image_size * side_shown, 3]),
+                [1, image_size * side_shown, image_size * side_shown, 1]),
             [0, 2, 1, 3]) * 255.
         tf.summary.image(
             "inputs",
@@ -1086,24 +1177,62 @@ class RealNVP(object):
                   input_=logit_x_in, hps=hps, n_scale=hps.n_scale,
                   use_batch_norm=hps.use_batch_norm, weight_norm=True,
                   train=False)
-        final_shape = [image_size, image_size, 3]
         prior_ll = standard_normal_ll(z_out)
         prior_ll = tf.reduce_sum(prior_ll, [1, 2, 3])
         log_diff = tf.reduce_sum(log_diff, [1, 2, 3])
         log_diff += transform_cost
-        cost = -(prior_ll + log_diff)
+        negative_log_likelihood = -tf.reduce_mean(prior_ll + log_diff)
+
+        state_size = image_size
+        context_size = np.prod(final_shape) - state_size
+
+        z_out_pairs_1, z_out_pairs_2 = tf.split(z_out, 2, axis=0)
+          # tf.reshape(z_out, [2] + [hps.batch_size//2] + final_shape), 2, axis=0)
+
+        # states_1, contexts_1 = tf.split(z_out_pairs_1, 2, axis=1)
+        # states_2, contexts_2 = tf.split(z_out_pairs_2, 2, axis=1)
+
+        # state_mean_square_differences = tf.norm(
+        #   (states_1 - states_2), ord='euclidean', axis=(1,2))
+        # context_mean_square_differences = tf.norm(
+        #   (contexts_1 - contexts_2), ord='euclidean', axis=(1,2))
+
+        states_1 = tf.matrix_diag_part(z_out_pairs_1[:,:,:,0])[:, :state_size]
+        states_2 = tf.matrix_diag_part(z_out_pairs_2[:,:,:,0])[:, :state_size]
+
+        state_sum_square_differences = tf.norm(
+          (states_1 - states_2), ord='euclidean', axis=1)
+        # state_sum_square_differences = tf.reduce_sum(
+        #   (states_1 - states_2) ** 2, axis=1)
+
+        context_sum_square_differences = tf.norm(
+          (z_out_pairs_1 - z_out_pairs_2), ord='euclidean', axis=(1,2)
+        ) - state_sum_square_differences
+
+        # context_sum_square_differences = tf.reduce_sum(
+        #   (z_out_pairs_1 - z_out_pairs_2) ** 2,
+        #   axis=list(range(1, z_out_pairs_1.shape.ndims))
+        # ) - state_sum_square_differences
+
+        state_mean_square_differences = (
+          state_sum_square_differences / state_size)
+        context_mean_square_differences = (
+          context_sum_square_differences / context_size)
 
         self.x_in = x_in
         self.z_out = z_out
-        self.cost = cost = tf.reduce_mean(cost)
 
         l2_reg = sum(
             [tf.reduce_sum(tf.square(v)) for v in tf.trainable_variables()
              if ("magnitude" in v.name) or ("rescaling_scale" in v.name)])
 
-        bit_per_dim = ((cost + numpy.log(256.) * image_size * image_size * 3.)
-                       / (image_size * image_size * 3. * numpy.log(2.)))
+        bit_per_dim = (
+          (negative_log_likelihood + numpy.log(256.) * image_size * image_size * 1.)
+          / (image_size * image_size * 1. * numpy.log(2.)))
         self.bit_per_dim = bit_per_dim
+
+        self.cost = cost = negative_log_likelihood
+        context_loss = tf.reduce_mean(context_mean_square_differences)
 
         # OPTIMIZATION
         momentum = 1. - hps.momentum
@@ -1137,8 +1266,10 @@ class RealNVP(object):
                                           "Gradient norm is NaN or Inf.")
 
         l2_z = tf.reduce_sum(tf.square(z_out), [1, 2, 3])
+
         if not sampling:
-            tf.summary.scalar("negative_log_likelihood", tf.reshape(cost, []))
+            tf.summary.scalar("negative_log_likelihood",
+                              tf.reshape(negative_log_likelihood, []))
             tf.summary.scalar("gradient_norm", tf.reshape(gradient_norm, []))
             tf.summary.scalar("bit_per_dim", tf.reshape(bit_per_dim, []))
             tf.summary.scalar("log_diff", tf.reshape(tf.reduce_mean(log_diff), []))
@@ -1157,15 +1288,32 @@ class RealNVP(object):
                 tf.reshape(tf.reduce_mean(tf.square(l2_z))
                            - tf.square(tf.reduce_mean(l2_z)), []))
 
+            tf.summary.scalar(
+                "state_square_difference",
+                tf.reshape(tf.reduce_mean(state_mean_square_differences), []))
+            tf.summary.scalar(
+                "context_square_difference",
+                tf.reshape(tf.reduce_mean(context_mean_square_differences), []))
+
+
+        # context_loss_op = tf.train.AdamOptimizer(
+        #   learning_rate=hps.learning_rate,
+        #   beta1=momentum, beta2=decay, epsilon=1e-08,
+        #   use_locking=False, name="Adam"
+        # ).minimize(context_loss + hps.l2_coeff * l2_reg)
 
         capped_grads_and_vars = zip(capped_grads, vars_)
-        self.train_step = optimizer.apply_gradients(
-            capped_grads_and_vars, global_step=step)
+        self.train_step = tf.group(
+          optimizer.apply_gradients(capped_grads_and_vars, global_step=step),
+          # context_loss_op
+        )
 
         # SAMPLING AND VISUALIZATION
         if sampling:
             # SAMPLES
-            sample = standard_normal_sample([100] + final_shape)
+            nx = ny = int(np.sqrt(hps.batch_size))
+            sample = standard_normal_sample([nx*ny] + final_shape)
+
             sample, _ = decoder(
                 input_=sample, hps=hps, n_scale=hps.n_scale,
                 use_batch_norm=hps.use_batch_norm, weight_norm=True,
@@ -1173,249 +1321,371 @@ class RealNVP(object):
             sample = tf.nn.sigmoid(sample)
 
             sample = tf.clip_by_value(sample, 0, 1) * 255.
-            sample = tf.reshape(sample, [100, image_size, image_size, 3])
+            sample = tf.reshape(sample, [hps.batch_size, image_size, image_size, 1])
             sample = tf.transpose(
-                tf.reshape(sample, [10, image_size * 10, image_size, 3]),
+                tf.reshape(sample, [10, image_size * 10, image_size, 1]),
                 [0, 2, 1, 3])
             sample = tf.transpose(
-                tf.reshape(sample, [1, image_size * 10, image_size * 10, 3]),
+                tf.reshape(sample, [1, image_size * 10, image_size * 10, 1]),
                 [0, 2, 1, 3])
             tf.summary.image(
                 "samples",
                 tf.cast(sample, tf.uint8),
                 max_outputs=1)
 
-            # CONCATENATION
-            concatenation, _ = encoder(
-                input_=logit_x_in, hps=hps,
-                n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=False)
-            concatenation = tf.reshape(
-                concatenation,
-                [(side_shown * side_shown), image_size, image_size, 3])
-            concatenation = tf.transpose(
-                tf.reshape(
-                    concatenation,
-                    [side_shown, image_size * side_shown, image_size, 3]),
-                [0, 2, 1, 3])
-            concatenation = tf.transpose(
-                tf.reshape(
-                    concatenation,
-                    [1, image_size * side_shown, image_size * side_shown, 3]),
-                [0, 2, 1, 3])
-            concatenation, _ = decoder(
-                input_=concatenation, hps=hps, n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=False)
-            concatenation = tf.nn.sigmoid(concatenation) * 255.
-            tf.summary.image(
-                "concatenation",
-                tf.cast(concatenation, tf.uint8),
-                max_outputs=1)
+            # # state x context images
+            if FLAGS.dataset == "moving-mnist":
+                # z_out_pairs_1, z_out_pairs_2 = tf.split(
+                #   squeeze_2x2_ordered(z_out), 2, axis=0)
+                # z_out_pairs_1[:,:,:,state_size:]
 
-            # MANIFOLD
+                sampled_states = standard_normal_sample(
+                    [nx] + states_1.shape[1:].as_list())
+                sampled_contexts = standard_normal_sample(
+                    [ny] + contexts_1.shape[1:].as_list())
 
-            # Data basis
-            z_u, _ = encoder(
-                input_=logit_x_in[:8, :, :, :], hps=hps,
-                n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=False)
-            u_1 = tf.reshape(z_u[0, :, :, :], [-1])
-            u_2 = tf.reshape(z_u[1, :, :, :], [-1])
-            u_3 = tf.reshape(z_u[2, :, :, :], [-1])
-            u_4 = tf.reshape(z_u[3, :, :, :], [-1])
-            u_5 = tf.reshape(z_u[4, :, :, :], [-1])
-            u_6 = tf.reshape(z_u[5, :, :, :], [-1])
-            u_7 = tf.reshape(z_u[6, :, :, :], [-1])
-            u_8 = tf.reshape(z_u[7, :, :, :], [-1])
+                X, Y = tf.meshgrid(
+                    tf.range(sampled_states.shape[0]),
+                    tf.range(sampled_contexts.shape[0]),
+                    indexing='ij')
 
-            # 3D dome
-            manifold_side = 8
-            angle_1 = numpy.arange(manifold_side) * 1. / manifold_side
-            angle_2 = numpy.arange(manifold_side) * 1. / manifold_side
-            angle_1 *= 2. * numpy.pi
-            angle_2 *= 2. * numpy.pi
-            angle_1 = angle_1.astype("float32")
-            angle_2 = angle_2.astype("float32")
-            angle_1 = tf.reshape(angle_1, [1, -1, 1])
-            angle_1 += tf.zeros([manifold_side, manifold_side, 1])
-            angle_2 = tf.reshape(angle_2, [-1, 1, 1])
-            angle_2 += tf.zeros([manifold_side, manifold_side, 1])
-            n_angle_3 = 40
-            angle_3 = numpy.arange(n_angle_3) * 1. / n_angle_3
-            angle_3 *= 2 * numpy.pi
-            angle_3 = angle_3.astype("float32")
-            angle_3 = tf.reshape(angle_3, [-1, 1, 1, 1])
-            angle_3 += tf.zeros([n_angle_3, manifold_side, manifold_side, 1])
-            manifold = tf.cos(angle_1) * (
-                tf.cos(angle_2) * (
-                    tf.cos(angle_3) * u_1 + tf.sin(angle_3) * u_2)
-                + tf.sin(angle_2) * (
-                    tf.cos(angle_3) * u_3 + tf.sin(angle_3) * u_4))
-            manifold += tf.sin(angle_1) * (
-                tf.cos(angle_2) * (
-                    tf.cos(angle_3) * u_5 + tf.sin(angle_3) * u_6)
-                + tf.sin(angle_2) * (
-                    tf.cos(angle_3) * u_7 + tf.sin(angle_3) * u_8))
-            manifold = tf.reshape(
-                manifold,
-                [n_angle_3 * manifold_side * manifold_side] + final_shape)
-            manifold, _ = decoder(
-                input_=manifold, hps=hps, n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=False)
-            manifold = tf.nn.sigmoid(manifold)
+                sample = tf.concat([
+                    tf.gather(sampled_states, X),
+                    tf.gather(sampled_contexts, Y)
+                ], axis=2)
+                sample = tf.reshape(sample, [nx*ny] + final_shape)
 
-            manifold = tf.clip_by_value(manifold, 0, 1) * 255.
-            manifold = tf.reshape(
-                manifold,
-                [n_angle_3,
-                 manifold_side * manifold_side,
-                 image_size,
-                 image_size,
-                 3])
-            manifold = tf.transpose(
-                tf.reshape(
-                    manifold,
-                    [n_angle_3, manifold_side,
-                     image_size * manifold_side, image_size, 3]), [0, 1, 3, 2, 4])
-            manifold = tf.transpose(
-                tf.reshape(
-                    manifold,
-                    [n_angle_3, image_size * manifold_side,
-                     image_size * manifold_side, 3]),
-                [0, 2, 1, 3])
-            manifold = tf.transpose(manifold, [1, 2, 0, 3])
-            manifold = tf.reshape(
-                manifold,
-                [1, image_size * manifold_side,
-                 image_size * manifold_side, 3 * n_angle_3])
-            tf.summary.image(
-                "manifold",
-                tf.cast(manifold[:, :, :, :3], tf.uint8),
-                max_outputs=1)
 
-            # COMPRESSION
-            z_complete, _ = encoder(
-                input_=logit_x_in[:hps.n_scale, :, :, :], hps=hps,
-                n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=False)
-            z_compressed_list = [z_complete]
-            z_noisy_list = [z_complete]
-            z_lost = z_complete
-            for scale_idx in xrange(hps.n_scale - 1):
-                z_lost = squeeze_2x2_ordered(z_lost)
-                z_lost, _ = tf.split(axis=3, num_or_size_splits=2, value=z_lost)
-                z_compressed = z_lost
-                z_noisy = z_lost
-                for _ in xrange(scale_idx + 1):
-                    z_compressed = tf.concat(
-                        [z_compressed, tf.zeros_like(z_compressed)], 3)
-                    z_compressed = squeeze_2x2_ordered(
-                        z_compressed, reverse=True)
-                    z_noisy = tf.concat(
-                        [z_noisy, tf.random_normal(
-                            z_noisy.get_shape().as_list())], 3)
-                    z_noisy = squeeze_2x2_ordered(z_noisy, reverse=True)
-                z_compressed_list.append(z_compressed)
-                z_noisy_list.append(z_noisy)
-            self.z_reduced = z_lost
-            z_compressed = tf.concat(z_compressed_list, 0)
-            z_noisy = tf.concat(z_noisy_list, 0)
-            noisy_images, _ = decoder(
-                input_=z_noisy, hps=hps, n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=False)
-            compressed_images, _ = decoder(
-                input_=z_compressed, hps=hps, n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=False)
-            noisy_images = tf.nn.sigmoid(noisy_images)
-            compressed_images = tf.nn.sigmoid(compressed_images)
+                # sampled_z = standard_normal_sample([nx] + [state_size])
+                # assert final_shape[-1] == 1
+                # sampled_phi = standard_normal_sample([ny] + final_shape[:-1])
 
-            noisy_images = tf.clip_by_value(noisy_images, 0, 1) * 255.
-            noisy_images = tf.reshape(
-                noisy_images,
-                [(hps.n_scale * hps.n_scale), image_size, image_size, 3])
-            noisy_images = tf.transpose(
-                tf.reshape(
-                    noisy_images,
-                    [hps.n_scale, image_size * hps.n_scale, image_size, 3]),
-                [0, 2, 1, 3])
-            noisy_images = tf.transpose(
-                tf.reshape(
-                    noisy_images,
-                    [1, image_size * hps.n_scale, image_size * hps.n_scale, 3]),
-                [0, 2, 1, 3])
-            tf.summary.image(
-                "noise",
-                tf.cast(noisy_images, tf.uint8),
-                max_outputs=1)
-            compressed_images = tf.clip_by_value(compressed_images, 0, 1) * 255.
-            compressed_images = tf.reshape(
-                compressed_images,
-                [(hps.n_scale * hps.n_scale), image_size, image_size, 3])
-            compressed_images = tf.transpose(
-                tf.reshape(
-                    compressed_images,
-                    [hps.n_scale, image_size * hps.n_scale, image_size, 3]),
-                [0, 2, 1, 3])
-            compressed_images = tf.transpose(
-                tf.reshape(
-                    compressed_images,
-                    [1, image_size * hps.n_scale, image_size * hps.n_scale, 3]),
-                [0, 2, 1, 3])
-            tf.summary.image(
-                "compression",
-                tf.cast(compressed_images, tf.uint8),
-                max_outputs=1)
+                # # sampled_z = - tf.ones([nx] + [state_size])
+                # # sampled_phi = tf.ones([ny] + final_shape[:-1])
 
-            # SAMPLES x2
-            final_shape[0] *= 2
-            final_shape[1] *= 2
-            big_sample = standard_normal_sample([25] + final_shape)
-            big_sample, _ = decoder(
-                input_=big_sample, hps=hps, n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=True)
-            big_sample = tf.nn.sigmoid(big_sample)
+                # X, Y = tf.meshgrid(
+                #   tf.range(sampled_z.shape[0]),
+                #   tf.range(sampled_phi.shape[0]),
+                #   indexing='ij')
 
-            big_sample = tf.clip_by_value(big_sample, 0, 1) * 255.
-            big_sample = tf.reshape(
-                big_sample,
-                [25, image_size * 2, image_size * 2, 3])
-            big_sample = tf.transpose(
-                tf.reshape(
-                    big_sample,
-                    [5, image_size * 10, image_size * 2, 3]), [0, 2, 1, 3])
-            big_sample = tf.transpose(
-                tf.reshape(
-                    big_sample,
-                    [1, image_size * 10, image_size * 10, 3]),
-                [0, 2, 1, 3])
-            tf.summary.image(
-                "big_sample",
-                tf.cast(big_sample, tf.uint8),
-                max_outputs=1)
+                # sample = tf.matrix_set_diag(
+                #   tf.gather(sampled_phi, Y), tf.gather(sampled_z, X))
 
-            # SAMPLES x10
-            final_shape[0] *= 5
-            final_shape[1] *= 5
-            extra_large = standard_normal_sample([1] + final_shape)
-            extra_large, _ = decoder(
-                input_=extra_large, hps=hps, n_scale=hps.n_scale,
-                use_batch_norm=hps.use_batch_norm, weight_norm=True,
-                train=True)
-            extra_large = tf.nn.sigmoid(extra_large)
+                # sample = tf.reshape(sample, [nx*ny] + final_shape)
+                # assert sample.shape.as_list() == [nx*ny] + final_shape
 
-            extra_large = tf.clip_by_value(extra_large, 0, 1) * 255.
-            tf.summary.image(
-                "extra_large",
-                tf.cast(extra_large, tf.uint8),
-                max_outputs=1)
+                sample, _ = decoder(
+                    input_=sample, hps=hps, n_scale=hps.n_scale,
+                    use_batch_norm=hps.use_batch_norm, weight_norm=True,
+                    train=True)
+                sample = tf.nn.sigmoid(sample)
+
+                sample = tf.clip_by_value(sample, 0, 1) * 255.
+                sample = tf.reshape(sample, [hps.batch_size, image_size, image_size, 1])
+                sample = tf.transpose(
+                    tf.reshape(sample, [10, image_size * 10, image_size, 1]),
+                    [0, 2, 1, 3])
+                sample = tf.transpose(
+                    tf.reshape(sample, [1, image_size * 10, image_size * 10, 1]),
+                    [0, 2, 1, 3])
+                tf.summary.image(
+                    "samples/state vs context",
+                    tf.cast(sample, tf.uint8),
+                    max_outputs=1)
+
+
+                # Fixes state vs context samples
+
+                sampled_states = tf.constant(
+                  np.random.normal(
+                    size=[nx] + states_1.shape[1:].as_list()),
+                  dtype=tf.float32)
+                sampled_contexts = tf.constant(
+                  np.random.normal(size=[ny] + contexts_1.shape[1:].as_list()),
+                  dtype=tf.float32)
+
+                X, Y = tf.meshgrid(
+                  tf.range(sampled_states.shape[0]),
+                  tf.range(sampled_contexts.shape[0]),
+                  indexing='ij')
+
+                sample = tf.concat([
+                  tf.gather(sampled_states, X),
+                  tf.gather(sampled_contexts, Y)
+                ], axis=2)
+                sample = tf.reshape(sample, [nx*ny] + final_shape)
+
+
+                # sampled_z = standard_normal_sample([nx] + [state_size])
+                # assert final_shape[-1] == 1
+                # sampled_phi = standard_normal_sample([ny] + final_shape[:-1])
+
+                # # sampled_z = - tf.ones([nx] + [state_size])
+                # # sampled_phi = tf.ones([ny] + final_shape[:-1])
+
+                # X, Y = tf.meshgrid(
+                #   tf.range(sampled_z.shape[0]),
+                #   tf.range(sampled_phi.shape[0]),
+                #   indexing='ij')
+
+                # sample = tf.matrix_set_diag(
+                #   tf.gather(sampled_phi, Y), tf.gather(sampled_z, X))
+
+                # sample = tf.reshape(sample, [nx*ny] + final_shape)
+                # assert sample.shape.as_list() == [nx*ny] + final_shape
+
+                sample, _ = decoder(
+                    input_=sample, hps=hps, n_scale=hps.n_scale,
+                    use_batch_norm=hps.use_batch_norm, weight_norm=True,
+                    train=True)
+                sample = tf.nn.sigmoid(sample)
+
+                sample = tf.clip_by_value(sample, 0, 1) * 255.
+                sample = tf.reshape(sample, [hps.batch_size, image_size, image_size, 1])
+                sample = tf.transpose(
+                    tf.reshape(sample, [10, image_size * 10, image_size, 1]),
+                    [0, 2, 1, 3])
+                sample = tf.transpose(
+                    tf.reshape(sample, [1, image_size * 10, image_size * 10, 1]),
+                    [0, 2, 1, 3])
+                tf.summary.image(
+                    "samples/fixed state vs context",
+                    tf.cast(sample, tf.uint8),
+                    max_outputs=1)
+
+
+
+            # # CONCATENATION
+            # concatenation, _ = encoder(
+            #     input_=logit_x_in, hps=hps,
+            #     n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=False)
+            # concatenation = tf.reshape(
+            #     concatenation,
+            #     [(side_shown * side_shown), image_size, image_size, 1])
+            # concatenation = tf.transpose(
+            #     tf.reshape(
+            #         concatenation,
+            #         [side_shown, image_size * side_shown, image_size, 1]),
+            #     [0, 2, 1, 3])
+            # concatenation = tf.transpose(
+            #     tf.reshape(
+            #         concatenation,
+            #         [1, image_size * side_shown, image_size * side_shown, 1]),
+            #     [0, 2, 1, 3])
+            # concatenation, _ = decoder(
+            #     input_=concatenation, hps=hps, n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=False)
+            # concatenation = tf.nn.sigmoid(concatenation) * 255.
+            # tf.summary.image(
+            #     "concatenation",
+            #     tf.cast(concatenation, tf.uint8),
+            #     max_outputs=1)
+
+            # # MANIFOLD
+
+            # # Data basis
+            # z_u, _ = encoder(
+            #     input_=logit_x_in[:8, :, :, :], hps=hps,
+            #     n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=False)
+            # u_1 = tf.reshape(z_u[0, :, :, :], [-1])
+            # u_2 = tf.reshape(z_u[1, :, :, :], [-1])
+            # u_3 = tf.reshape(z_u[2, :, :, :], [-1])
+            # u_4 = tf.reshape(z_u[3, :, :, :], [-1])
+            # u_5 = tf.reshape(z_u[4, :, :, :], [-1])
+            # u_6 = tf.reshape(z_u[5, :, :, :], [-1])
+            # u_7 = tf.reshape(z_u[6, :, :, :], [-1])
+            # u_8 = tf.reshape(z_u[7, :, :, :], [-1])
+
+            # # 3D dome
+            # manifold_side = 8
+            # angle_1 = numpy.arange(manifold_side) * 1. / manifold_side
+            # angle_2 = numpy.arange(manifold_side) * 1. / manifold_side
+            # angle_1 *= 2. * numpy.pi
+            # angle_2 *= 2. * numpy.pi
+            # angle_1 = angle_1.astype("float32")
+            # angle_2 = angle_2.astype("float32")
+            # angle_1 = tf.reshape(angle_1, [1, -1, 1])
+            # angle_1 += tf.zeros([manifold_side, manifold_side, 1])
+            # angle_2 = tf.reshape(angle_2, [-1, 1, 1])
+            # angle_2 += tf.zeros([manifold_side, manifold_side, 1])
+            # n_angle_3 = 40
+            # angle_3 = numpy.arange(n_angle_3) * 1. / n_angle_3
+            # angle_3 *= 2 * numpy.pi
+            # angle_3 = angle_3.astype("float32")
+            # angle_3 = tf.reshape(angle_3, [-1, 1, 1, 1])
+            # angle_3 += tf.zeros([n_angle_3, manifold_side, manifold_side, 1])
+            # manifold = tf.cos(angle_1) * (
+            #     tf.cos(angle_2) * (
+            #         tf.cos(angle_3) * u_1 + tf.sin(angle_3) * u_2)
+            #     + tf.sin(angle_2) * (
+            #         tf.cos(angle_3) * u_3 + tf.sin(angle_3) * u_4))
+            # manifold += tf.sin(angle_1) * (
+            #     tf.cos(angle_2) * (
+            #         tf.cos(angle_3) * u_5 + tf.sin(angle_3) * u_6)
+            #     + tf.sin(angle_2) * (
+            #         tf.cos(angle_3) * u_7 + tf.sin(angle_3) * u_8))
+            # manifold = tf.reshape(
+            #     manifold,
+            #     [n_angle_3 * manifold_side * manifold_side] + final_shape)
+            # manifold, _ = decoder(
+            #     input_=manifold, hps=hps, n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=False)
+            # manifold = tf.nn.sigmoid(manifold)
+
+            # manifold = tf.clip_by_value(manifold, 0, 1) * 255.
+            # manifold = tf.reshape(
+            #     manifold,
+            #     [n_angle_3,
+            #      manifold_side * manifold_side,
+            #      image_size,
+            #      image_size,
+            #      1])
+            # manifold = tf.transpose(
+            #     tf.reshape(
+            #         manifold,
+            #         [n_angle_3, manifold_side,
+            #          image_size * manifold_side, image_size, 1]), [0, 1, 3, 2, 4])
+            # manifold = tf.transpose(
+            #     tf.reshape(
+            #         manifold,
+            #         [n_angle_3, image_size * manifold_side,
+            #          image_size * manifold_side, 1]),
+            #     [0, 2, 1, 3])
+            # manifold = tf.transpose(manifold, [1, 2, 0, 3])
+            # manifold = tf.reshape(
+            #     manifold,
+            #     [1, image_size * manifold_side,
+            #      image_size * manifold_side, 1 * n_angle_3])
+            # tf.summary.image(
+            #     "manifold",
+            #     tf.cast(manifold[:, :, :, :3], tf.uint8),
+            #     max_outputs=1)
+
+            # # COMPRESSION
+            # z_complete, _ = encoder(
+            #     input_=logit_x_in[:hps.n_scale, :, :, :], hps=hps,
+            #     n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=False)
+            # z_compressed_list = [z_complete]
+            # z_noisy_list = [z_complete]
+            # z_lost = z_complete
+            # for scale_idx in xrange(hps.n_scale - 1):
+            #     z_lost = squeeze_2x2_ordered(z_lost)
+            #     z_lost, _ = tf.split(axis=3, num_or_size_splits=2, value=z_lost)
+            #     z_compressed = z_lost
+            #     z_noisy = z_lost
+            #     for _ in xrange(scale_idx + 1):
+            #         z_compressed = tf.concat(
+            #             [z_compressed, tf.zeros_like(z_compressed)], 3)
+            #         z_compressed = squeeze_2x2_ordered(
+            #             z_compressed, reverse=True)
+            #         z_noisy = tf.concat(
+            #             [z_noisy, tf.random_normal(
+            #                 z_noisy.get_shape().as_list())], 3)
+            #         z_noisy = squeeze_2x2_ordered(z_noisy, reverse=True)
+            #     z_compressed_list.append(z_compressed)
+            #     z_noisy_list.append(z_noisy)
+            # self.z_reduced = z_lost
+            # z_compressed = tf.concat(z_compressed_list, 0)
+            # z_noisy = tf.concat(z_noisy_list, 0)
+            # noisy_images, _ = decoder(
+            #     input_=z_noisy, hps=hps, n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=False)
+            # compressed_images, _ = decoder(
+            #     input_=z_compressed, hps=hps, n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=False)
+            # noisy_images = tf.nn.sigmoid(noisy_images)
+            # compressed_images = tf.nn.sigmoid(compressed_images)
+
+            # noisy_images = tf.clip_by_value(noisy_images, 0, 1) * 255.
+            # noisy_images = tf.reshape(
+            #     noisy_images,
+            #     [(hps.n_scale * hps.n_scale), image_size, image_size, 1])
+            # noisy_images = tf.transpose(
+            #     tf.reshape(
+            #         noisy_images,
+            #         [hps.n_scale, image_size * hps.n_scale, image_size, 1]),
+            #     [0, 2, 1, 3])
+            # noisy_images = tf.transpose(
+            #     tf.reshape(
+            #         noisy_images,
+            #         [1, image_size * hps.n_scale, image_size * hps.n_scale, 1]),
+            #     [0, 2, 1, 3])
+            # tf.summary.image(
+            #     "noise",
+            #     tf.cast(noisy_images, tf.uint8),
+            #     max_outputs=1)
+            # compressed_images = tf.clip_by_value(compressed_images, 0, 1) * 255.
+            # compressed_images = tf.reshape(
+            #     compressed_images,
+            #     [(hps.n_scale * hps.n_scale), image_size, image_size, 1])
+            # compressed_images = tf.transpose(
+            #     tf.reshape(
+            #         compressed_images,
+            #         [hps.n_scale, image_size * hps.n_scale, image_size, 1]),
+            #     [0, 2, 1, 3])
+            # compressed_images = tf.transpose(
+            #     tf.reshape(
+            #         compressed_images,
+            #         [1, image_size * hps.n_scale, image_size * hps.n_scale, 1]),
+            #     [0, 2, 1, 3])
+            # tf.summary.image(
+            #     "compression",
+            #     tf.cast(compressed_images, tf.uint8),
+            #     max_outputs=1)
+
+            # # SAMPLES x2
+            # final_shape[0] *= 2
+            # final_shape[1] *= 2
+            # big_sample = standard_normal_sample([25] + final_shape)
+            # big_sample, _ = decoder(
+            #     input_=big_sample, hps=hps, n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=True)
+            # big_sample = tf.nn.sigmoid(big_sample)
+
+            # big_sample = tf.clip_by_value(big_sample, 0, 1) * 255.
+            # big_sample = tf.reshape(
+            #     big_sample,
+            #     [25, image_size * 2, image_size * 2, 1])
+            # big_sample = tf.transpose(
+            #     tf.reshape(
+            #         big_sample,
+            #         [5, image_size * 10, image_size * 2, 1]), [0, 2, 1, 3])
+            # big_sample = tf.transpose(
+            #     tf.reshape(
+            #         big_sample,
+            #         [1, image_size * 10, image_size * 10, 1]),
+            #     [0, 2, 1, 3])
+            # tf.summary.image(
+            #     "big_sample",
+            #     tf.cast(big_sample, tf.uint8),
+            #     max_outputs=1)
+
+            # # SAMPLES x10
+            # final_shape[0] *= 5
+            # final_shape[1] *= 5
+            # extra_large = standard_normal_sample([1] + final_shape)
+            # extra_large, _ = decoder(
+            #     input_=extra_large, hps=hps, n_scale=hps.n_scale,
+            #     use_batch_norm=hps.use_batch_norm, weight_norm=True,
+            #     train=True)
+            # extra_large = tf.nn.sigmoid(extra_large)
+
+            # extra_large = tf.clip_by_value(extra_large, 0, 1) * 255.
+            # tf.summary.image(
+            #     "extra_large",
+            #     tf.cast(extra_large, tf.uint8),
+            #     max_outputs=1)
 
     def eval_epoch(self, hps):
         """Evaluate bits/dim."""
@@ -1465,7 +1735,9 @@ def train_model(hps, logdir):
             # implementations.
             sess = tf.Session(config=tf.ConfigProto(
                 allow_soft_placement=True,
-                log_device_placement=True))
+                log_device_placement=True,
+                gpu_options=tf.GPUOptions(allow_growth=True)
+            ))
             sess.run(init)
 
             ckpt_state = tf.train.get_checkpoint_state(logdir)
@@ -1536,7 +1808,8 @@ def evaluate(hps, logdir, traindir, subset="valid", return_val=False):
             saver = tf.train.Saver()
             sess = tf.Session(config=tf.ConfigProto(
                 allow_soft_placement=True,
-                log_device_placement=True))
+                log_device_placement=True,
+                gpu_options=tf.GPUOptions(allow_growth=True)))
             tf.train.start_queue_runners(sess)
 
             previous_global_step = 0  # don"t run eval for step = 0
@@ -1588,7 +1861,9 @@ def sample_from_model(hps, logdir, traindir):
             saver = tf.train.Saver()
             sess = tf.Session(config=tf.ConfigProto(
                 allow_soft_placement=True,
-                log_device_placement=True))
+                log_device_placement=True,
+                gpu_options=tf.GPUOptions(per_process_gpu_memory_fraction=0.1)
+            ))
             coord = tf.train.Coordinator()
             threads = tf.train.start_queue_runners(sess=sess, coord=coord)
 
